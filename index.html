@@ -4,6 +4,18 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>WebXR AR • RPM + Mixamo autoplay</title>
+  <link rel="icon" href="data:,"><!-- kill favicon 404 -->
+
+  <!-- map bare specifier "three" to the CDN module -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/examples/jsm/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+
   <style>
     html, body { margin:0; height:100%; background:#000; }
     #enter-ar { position:fixed; left:12px; bottom:12px; z-index:10; }
@@ -14,10 +26,10 @@
 <div class="hint">Auto-place on first plane. Animations loop.</div>
 
 <script type="module">
-  import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
-  import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
-  import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/DRACOLoader.js';
-  import { ARButton } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/webxr/ARButton.js';
+  import * as THREE from 'three';
+  import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+  import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
+  import { ARButton } from 'three/examples/jsm/webxr/ARButton.js';
 
   // local assets in ./assets
   const AVATAR_URL = './assets/model_avatar.glb';
@@ -25,7 +37,8 @@
     './assets/Talking1.glb',
     './assets/Talking2.glb',
     './assets/Talking3.glb',
-    './assets/Breathing Idle.glb',
+    './assets/Breathing_Idle.glb' // rename file to remove space
+    // or './assets/Breathing%20Idle.glb' if you keep the space
   ];
 
   const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true, powerPreference:'high-performance' });
@@ -68,17 +81,19 @@
   const avatarPromise = gltfLoader.loadAsync(AVATAR_URL).then(gltf => {
     avatar = gltf.scene;
     avatar.scale.setScalar(1.0);
-    avatar.traverse(o => { if (o.isMesh) { o.frustumCulled = false; }});
+    avatar.traverse(o => { if (o.isMesh) o.frustumCulled = false; });
     avatar.visible = false;
     scene.add(avatar);
     mixer = new THREE.AnimationMixer(avatar);
   });
 
   const animPromises = ANIM_URLS.map(url => gltfLoader.loadAsync(url).then(gltf => {
-    if (gltf.animations && gltf.animations.length) {
+    if (gltf.animations?.length) {
       const clip = gltf.animations[0].clone();
       if (!clip.name) clip.name = url.split('/').pop();
       clips.push(clip);
+    } else {
+      console.warn('No animations in', url);
     }
   }));
 
@@ -103,12 +118,12 @@
     const viewerSpace = await session.requestReferenceSpace('viewer');
     localSpace = await session.requestReferenceSpace('local');
     xrHitTestSource = await session.requestHitTestSource({ space: viewerSpace });
-    if (mixer) mixer.addEventListener('finished', onFinished);
+    mixer?.addEventListener('finished', onFinished);
   }
   function onSessionEnd() {
     xrHitTestSource = null;
     localSpace = null;
-    if (mixer) mixer.removeEventListener('finished', onFinished);
+    mixer?.removeEventListener('finished', onFinished);
   }
   renderer.xr.addEventListener('sessionstart', onSessionStart);
   renderer.xr.addEventListener('sessionend', onSessionEnd);
@@ -135,7 +150,7 @@
       }
     }
 
-    if (mixer) mixer.update(dt);
+    mixer?.update(dt);
     renderer.render(scene, camera);
   });
 
@@ -143,17 +158,13 @@
     if (!reticle.visible || !avatar) return;
     avatar.visible = true;
     avatar.position.setFromMatrixPosition(reticle.matrix);
-    // face camera horizontally
     const cam = renderer.xr.getCamera(camera);
     avatar.lookAt(new THREE.Vector3(cam.position.x, avatar.position.y, cam.position.z));
     placed = true;
     reticle.visible = false;
 
-    if (clips.length) {
-      playNext();
-    } else {
-      Promise.all(animPromises).then(() => playNext());
-    }
+    if (clips.length) playNext();
+    else Promise.all(animPromises).then(() => playNext());
   }
 
   const controller = renderer.xr.getController(0);
