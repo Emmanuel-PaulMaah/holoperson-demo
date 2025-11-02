@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WebXR AR • RPM + Mixamo autoplay</title>
+  <style>
+    html, body { margin:0; height:100%; background:#000; }
+    #enter-ar { position:fixed; left:12px; bottom:12px; z-index:10; }
+    .hint { position:fixed; left:12px; top:12px; color:#fff; font:14px/1.4 system-ui, sans-serif; }
+  </style>
+</head>
+<body>
+<div class="hint">Auto-place on first plane. Animations loop.</div>
+
+<script type="module">
+  import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+  import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+  import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/DRACOLoader.js';
+  import { ARButton } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/webxr/ARButton.js';
+
+  // local assets in ./assets
+  const AVATAR_URL = './assets/model_avatar.glb';
+  const ANIM_URLS = [
+    './assets/Talking1.glb',
+    './assets/Talking2.glb',
+    './assets/Talking3.glb',
+    './assets/Breathing Idle.glb',
+  ];
+
+  const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true, powerPreference:'high-performance' });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.xr.enabled = true;
+  document.body.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera();
+
+  const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
+  scene.add(light);
+
+  const reticle = new THREE.Mesh(
+    new THREE.RingGeometry(0.12, 0.15, 32).rotateX(-Math.PI/2),
+    new THREE.MeshBasicMaterial({ color:0xffffff })
+  );
+  reticle.matrixAutoUpdate = false;
+  reticle.visible = false;
+  scene.add(reticle);
+
+  const arButton = ARButton.createButton(renderer, {
+    requiredFeatures: ['hit-test'],
+    optionalFeatures: ['anchors']
+  });
+  arButton.id = 'enter-ar';
+  document.body.appendChild(arButton);
+
+  const gltfLoader = new GLTFLoader();
+  const draco = new DRACOLoader();
+  draco.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/draco/');
+  gltfLoader.setDRACOLoader(draco);
+
+  let avatar, mixer;
+  let clips = [];
+  let playingIndex = -1;
+  let placed = false;
+
+  const avatarPromise = gltfLoader.loadAsync(AVATAR_URL).then(gltf => {
+    avatar = gltf.scene;
+    avatar.scale.setScalar(1.0);
+    avatar.traverse(o => { if (o.isMesh) { o.frustumCulled = false; }});
+    avatar.visible = false;
+    scene.add(avatar);
+    mixer = new THREE.AnimationMixer(avatar);
+  });
+
+  const animPromises = ANIM_URLS.map(url => gltfLoader.loadAsync(url).then(gltf => {
+    if (gltf.animations && gltf.animations.length) {
+      const clip = gltf.animations[0].clone();
+      if (!clip.name) clip.name = url.split('/').pop();
+      clips.push(clip);
+    }
+  }));
+
+  function playNext() {
+    if (!clips.length || !mixer) return;
+    playingIndex = (playingIndex + 1) % clips.length;
+    const clip = clips[playingIndex];
+    mixer.stopAllAction();
+    const action = mixer.clipAction(clip);
+    action.reset();
+    action.setLoop(THREE.LoopOnce, 1);
+    action.clampWhenFinished = true;
+    action.fadeIn(0.2).play();
+  }
+  function onFinished() { playNext(); }
+
+  let xrHitTestSource = null;
+  let localSpace = null;
+
+  async function onSessionStart() {
+    const session = renderer.xr.getSession();
+    const viewerSpace = await session.requestReferenceSpace('viewer');
+    localSpace = await session.requestReferenceSpace('local');
+    xrHitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+    if (mixer) mixer.addEventListener('finished', onFinished);
+  }
+  function onSessionEnd() {
+    xrHitTestSource = null;
+    localSpace = null;
+    if (mixer) mixer.removeEventListener('finished', onFinished);
+  }
+  renderer.xr.addEventListener('sessionstart', onSessionStart);
+  renderer.xr.addEventListener('sessionend', onSessionEnd);
+
+  addEventListener('resize', () => {
+    renderer.setSize(innerWidth, innerHeight);
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+  });
+
+  const clock = new THREE.Clock();
+  renderer.setAnimationLoop((t, frame) => {
+    const dt = clock.getDelta();
+
+    if (frame && xrHitTestSource && !placed) {
+      const hitResults = frame.getHitTestResults(xrHitTestSource);
+      if (hitResults.length) {
+        const pose = hitResults[0].getPose(localSpace);
+        reticle.visible = true;
+        reticle.matrix.fromArray(pose.transform.matrix);
+        if (!placed && avatar) placeAtReticle();
+      } else {
+        reticle.visible = false;
+      }
+    }
+
+    if (mixer) mixer.update(dt);
+    renderer.render(scene, camera);
+  });
+
+  function placeAtReticle() {
+    if (!reticle.visible || !avatar) return;
+    avatar.visible = true;
+    avatar.position.setFromMatrixPosition(reticle.matrix);
+    // face camera horizontally
+    const cam = renderer.xr.getCamera(camera);
+    avatar.lookAt(new THREE.Vector3(cam.position.x, avatar.position.y, cam.position.z));
+    placed = true;
+    reticle.visible = false;
+
+    if (clips.length) {
+      playNext();
+    } else {
+      Promise.all(animPromises).then(() => playNext());
+    }
+  }
+
+  const controller = renderer.xr.getController(0);
+  controller.addEventListener('select', () => { if (!placed) placeAtReticle(); });
+  scene.add(controller);
+
+  Promise.all([avatarPromise, Promise.all(animPromises)]).catch(err => console.error('Load failed:', err));
+</script>
+</body>
+</html>
