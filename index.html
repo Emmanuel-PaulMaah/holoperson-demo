@@ -3,9 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>WebXR AR • RPM + Mixamo autoplay</title>
+  <title>WebXR AR • RPM + Mixamo autoplay + light estimation</title>
   <link rel="icon" href="data:,">
-
   <script type="importmap">
   {
     "imports": {
@@ -14,23 +13,21 @@
     }
   }
   </script>
-
   <style>
     html, body { margin:0; height:100%; background:#000; }
-    #reset { position:fixed; left:12px; bottom:12px; z-index:10; }
+    #enter-ar { position:fixed; left:12px; bottom:12px; z-index:10; }
     .hint { position:fixed; left:12px; top:12px; color:#fff; font:14px/1.4 system-ui, sans-serif; }
   </style>
 </head>
 <body>
-<div class="hint">Auto-place on first plane. Animations cross-fade and cycle.</div>
-<button id="reset">Reset</button>
+<div class="hint">Auto-place on first plane. Animations cycle. Uses real-world light when available.</div>
 
 <script type="module">
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
+import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
 import { ARButton } from 'three/examples/jsm/webxr/ARButton.js';
-import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 
 const AVATAR_URL = './assets/model_avatar.glb';
 const ANIM_URLS = [
@@ -43,24 +40,28 @@ const ANIM_URLS = [
 // renderer
 const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
 renderer.xr.enabled = true;
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
 document.body.appendChild(renderer.domElement);
+addEventListener('resize', ()=>renderer.setSize(innerWidth, innerHeight), { passive:true });
 
 // scene
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera();
 
-// lighting: IBL + hemi + key
-const pmrem = new THREE.PMREMGenerator(renderer);
-scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.5).texture;
-
+// fallback lights
 const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.6);
-scene.add(hemi);
+const dir  = new THREE.DirectionalLight(0xffffff, 0.4);
+dir.position.set(1,2,1);
+scene.add(hemi, dir);
 
-const key = new THREE.DirectionalLight(0xffffff, 0.8);
-key.position.set(1, 2, 1);
-scene.add(key);
+// IBL fallback (keeps AR passthrough since we do not set background)
+new RGBELoader()
+  .setPath('https://cdn.jsdelivr.net/gh/pmndrs/drei-assets@master/hdri/')
+  .load('venice_sunset_1k.hdr', (hdr)=>{
+    hdr.mapping = THREE.EquirectangularReflectionMapping;
+    scene.environment = hdr;
+  });
 
 // reticle
 const reticle = new THREE.Mesh(
@@ -71,10 +72,10 @@ reticle.matrixAutoUpdate = false;
 reticle.visible = false;
 scene.add(reticle);
 
-// button
+// AR button
 document.body.appendChild(ARButton.createButton(renderer,{
   requiredFeatures:['hit-test'],
-  optionalFeatures:['dom-overlay','anchors'],
+  optionalFeatures:['dom-overlay','anchors','light-estimation'],
   domOverlay:{ root: document.body }
 }));
 
@@ -86,218 +87,159 @@ gltf.setDRACOLoader(draco);
 
 // avatar + anims
 let avatar, mixer, outline;
-let clips = [];
-let placed = false;
-let currentAction = null;
+let clips=[];
+let placed=false;
 
-// error-safe GLB load
-async function loadGLB(url){
-  try {
-    return await gltf.loadAsync(url);
-  } catch (e) {
-    console.error('GLB load failed', url, e);
-    return { scene: new THREE.Group(), animations: [] };
-  }
-}
+await gltf.loadAsync(AVATAR_URL).then(g=>{
+  avatar=g.scene;
+  scene.add(avatar);
+  avatar.visible=false;
+  mixer=new THREE.AnimationMixer(avatar);
+  mixer.addEventListener('finished', ()=> playNext()); // auto-cycle
+  outline=new THREE.BoxHelper(avatar,0xff7a00);
+  outline.visible=false;
+  scene.add(outline);
+});
 
-const avatarG = await loadGLB(AVATAR_URL);
-avatar = avatarG.scene;
-scene.add(avatar);
-avatar.visible = false;
+await Promise.all(
+  ANIM_URLS.map(u =>
+    gltf.loadAsync(u).then(g=>{
+      if(g.animations?.length) clips.push(g.animations[0]);
+    })
+  )
+);
 
-mixer = new THREE.AnimationMixer(avatar);
-
-outline = new THREE.BoxHelper(avatar, 0xff7a00);
-outline.matrixAutoUpdate = false;
-outline.visible = false;
-scene.add(outline);
-
-await Promise.all(ANIM_URLS.map(async u=>{
-  const g = await loadGLB(u);
-  if (g.animations?.length) clips.push(g.animations[0]);
-}));
-
-function playNext(fade=0.3){
-  if (!clips.length) return;
+let currentAction=null;
+function playNext(){
+  if(!clips.length || !mixer) return;
   const clip = clips.shift(); clips.push(clip);
   const next = mixer.clipAction(clip);
-  next.reset().setLoop(THREE.LoopOnce, 0);
+  next.setLoop(THREE.LoopOnce, 1);
   next.clampWhenFinished = true;
-  if (currentAction) {
-    currentAction.crossFadeTo(next, fade, false);
+  next.reset();
+  if(currentAction){
+    currentAction.crossFadeTo(next, 0.25, false);
+    next.play();
+  } else {
+    next.fadeIn(0.25).play();
   }
-  next.play();
   currentAction = next;
 }
-mixer.addEventListener('finished', () => playNext());
 
 // XR vars
 let viewerSpace, localSpace, planeSource, fingerSource;
-let lastHit = null;       // last plane hit result for anchoring
-let anchor = null;        // XRAnchor handle
-
+let xrLightProbe=null, xrDirLight=null;
 let lastDist, lastAngle, baseScale=1, baseRotY=0;
-let fingersActive = 0;
 
-renderer.xr.addEventListener('sessionstart', async ()=>{
-  const s = renderer.xr.getSession();
-  viewerSpace = await s.requestReferenceSpace('viewer');
-  localSpace  = await s.requestReferenceSpace('local');
-  planeSource = await s.requestHitTestSource({ space: viewerSpace });
-  fingerSource = await s.requestHitTestSourceForTransientInput({ profile: 'generic-touchscreen' });
+renderer.xr.addEventListener('sessionstart',async()=>{
+  const s=renderer.xr.getSession();
+  viewerSpace=await s.requestReferenceSpace('viewer');
+  localSpace=await s.requestReferenceSpace('local');
+  planeSource=await s.requestHitTestSource({space:viewerSpace});
+  fingerSource=await s.requestHitTestSourceForTransientInput({profile:'generic-touchscreen'});
+
+  // light estimation
+  try{
+    const probe = await s.requestLightProbe?.({ reflectionFormat: 'srgba8' });
+    if(probe){
+      xrLightProbe = probe;
+      xrDirLight = new THREE.DirectionalLight(0xffffff, 0.0);
+      scene.add(xrDirLight);
+      hemi.intensity = 0.2;
+      dir.intensity  = 0.1;
+    }
+  }catch(e){
+    // unsupported or permissions denied
+  }
 });
 
-renderer.xr.addEventListener('sessionend', ()=>{
-  viewerSpace = localSpace = planeSource = fingerSource = null;
-  lastHit = null;
-  placed = false;
-  lastDist = undefined;
-  fingersActive = 0;
-  outline.visible = false;
-  if (anchor?.delete) { try { anchor.delete(); } catch {} }
-  anchor = null;
-  // keep avatar loaded but hidden for next session
-  avatar.visible = false;
-  currentAction = null;
-  mixer.stopAllAction();
+renderer.xr.addEventListener('sessionend',()=>{
+  viewerSpace=localSpace=planeSource=fingerSource=null;
+  placed=false;
+  if(xrDirLight){ scene.remove(xrDirLight); xrDirLight=null; }
+  xrLightProbe=null;
+  hemi.intensity = 0.6;
+  dir.intensity  = 0.4;
 });
 
-// resize
-addEventListener('resize', ()=>{ renderer.setSize(innerWidth, innerHeight); });
-
-const clock = new THREE.Clock();
-
-// stable auto-place state
-let stableCount = 0;
-const lastPoseMat = new THREE.Matrix4();
-
-renderer.setAnimationLoop((_, frame)=>{
-  const dt = clock.getDelta();
+// loop
+const clock=new THREE.Clock();
+renderer.setAnimationLoop((_,frame)=>{
+  const dt=clock.getDelta();
   mixer?.update(dt);
 
-  // anchor pose update
-  if (frame && anchor?.anchorSpace && localSpace && avatar.visible) {
-    const ap = frame.getPose(anchor.anchorSpace, localSpace);
-    if (ap) {
-      avatar.matrix.fromArray(ap.transform.matrix);
-      avatar.matrix.decompose(avatar.position, avatar.quaternion, avatar.scale);
+  // update real-world lighting
+  if(frame && xrLightProbe && xrDirLight){
+    const est = frame.getLightEstimate?.(xrLightProbe);
+    if(est){
+      const d = est.primaryLightDirection;   // Float32Array[3]
+      const i = est.primaryLightIntensity;   // Float32Array[3]
+      // position opposite to direction vector so light points along the estimate
+      xrDirLight.position.set(-d[0], -d[1], -d[2]).normalize();
+
+      // compute luminance and color
+      const r=i[0], g=i[1], b=i[2];
+      const luminance = 0.2126*r + 0.7152*g + 0.0722*b;
+      const scale = 0.002; // tame to Three intensity range
+      const targetIntensity = luminance * scale;
+      xrDirLight.intensity = THREE.MathUtils.lerp(xrDirLight.intensity, targetIntensity, 0.2);
+
+      const maxc = Math.max(r,g,b) || 1.0;
+      xrDirLight.color.setRGB(r/maxc, g/maxc, b/maxc).convertSRGBToLinear();
     }
   }
 
-  // reticle + auto-place
-  if (frame && planeSource && !placed){
-    const hits = frame.getHitTestResults(planeSource);
-    if (hits.length){
-      const hit = hits[0];
-      const pose = hit.getPose(localSpace);
-      if (pose){
-        const m = new THREE.Matrix4().fromArray(pose.transform.matrix);
-        reticle.visible = true;
-        reticle.matrix.copy(m);
-        if (lastPoseMat.equals(m)) stableCount++; else { stableCount = 0; lastPoseMat.copy(m); }
-        lastHit = hit;
-        if (stableCount > 15) place(reticle.matrix, lastHit, frame);
-      }
-    } else {
-      reticle.visible = false;
-      stableCount = 0;
-      lastHit = null;
-    }
+  // plane reticle
+  if(frame && planeSource && !placed){
+    const hits=frame.getHitTestResults(planeSource);
+    if(hits.length){
+      const pose=hits[0].getPose(localSpace);
+      reticle.visible=true;
+      reticle.matrix.fromArray(pose.transform.matrix);
+    } else reticle.visible=false;
   }
 
   // gestures
-  if (frame && fingerSource){
-    const fingers = frame.getHitTestResultsForTransientInput(fingerSource);
-    if (fingers.length){
-      outline.visible = true;
-
-      if (!placed && reticle.visible) place(reticle.matrix, lastHit, frame);
-
-      if (placed){
-        const got = fingers.filter(f=>f.results?.length).slice(0,2);
-        if (fingersActive !== got.length) {
-          lastDist = undefined;
-        }
-        fingersActive = got.length;
-
-        if (got.length === 1){
-          const r = got[0].results[0];
-          const pose = r.getPose(localSpace);
-          if (pose){
-            const m = new THREE.Matrix4().fromArray(pose.transform.matrix);
-            const pos = new THREE.Vector3().setFromMatrixPosition(m);
-            avatar.position.set(pos.x, avatar.position.y, pos.z);
-          }
-        } else if (got.length === 2){
-          const [r1, r2] = got.map(f=>f.results[0]);
-          const p1 = new THREE.Vector3().setFromMatrixPosition(new THREE.Matrix4().fromArray(r1.getPose(localSpace).transform.matrix));
-          const p2 = new THREE.Vector3().setFromMatrixPosition(new THREE.Matrix4().fromArray(r2.getPose(localSpace).transform.matrix));
-          const v1 = new THREE.Vector2(p1.x, p1.z);
-          const v2 = new THREE.Vector2(p2.x, p2.z);
-          const dist = Math.max(1e-4, v1.distanceTo(v2));
-          const angle = Math.atan2(v2.y - v1.y, v2.x - v1.x);
-          if (lastDist === undefined){ lastDist = dist; lastAngle = angle; baseScale = avatar.scale.x; baseRotY = avatar.rotation.y; }
-          avatar.scale.setScalar(THREE.MathUtils.clamp(baseScale * (dist/lastDist), 0.2, 3));
-          avatar.rotation.y = baseRotY + (angle - lastAngle);
+  if(frame && fingerSource){
+    const fingers=frame.getHitTestResultsForTransientInput(fingerSource);
+    if(fingers.length){
+      outline.visible=true;
+      if(!placed && reticle.visible) place(reticle.matrix);
+      if(placed){
+        if(fingers.length===1 && fingers[0].results.length){
+          const pose=fingers[0].results[0].getPose(localSpace);
+          const m=new THREE.Matrix4().fromArray(pose.transform.matrix);
+          const pos=new THREE.Vector3().setFromMatrixPosition(m);
+          avatar.position.set(pos.x, avatar.position.y, pos.z);
+        } else if(fingers.length===2 && fingers[0].results.length && fingers[1].results.length){
+          const p1=new THREE.Vector3().setFromMatrixPosition(new THREE.Matrix4().fromArray(fingers[0].results[0].getPose(localSpace).transform.matrix));
+          const p2=new THREE.Vector3().setFromMatrixPosition(new THREE.Matrix4().fromArray(fingers[1].results[0].getPose(localSpace).transform.matrix));
+          const v1=new THREE.Vector2(p1.x,p1.z);
+          const v2=new THREE.Vector2(p2.x,p2.z);
+          const dist=v1.distanceTo(v2);
+          const angle=Math.atan2(v2.y-v1.y,v2.x-v1.x);
+          if(lastDist===undefined){lastDist=dist;lastAngle=angle;baseScale=avatar.scale.x;baseRotY=avatar.rotation.y;}
+          const s=THREE.MathUtils.clamp(baseScale*(dist/lastDist),0.2,3);
+          avatar.scale.setScalar(s);
+          avatar.rotation.y=baseRotY+(angle-lastAngle);
         }
       }
-    } else {
-      outline.visible = false;
-      lastDist = undefined;
-      fingersActive = 0;
-    }
+    } else {outline.visible=false; lastDist=undefined;}
   }
 
-  // keep outline synced
-  outline.updateMatrixWorld(true);
-  outline.update();
-
-  renderer.render(scene, camera);
+  renderer.render(scene,camera);
 });
 
-async function place(m, hitResult, frame){
-  avatar.visible = true;
-
-  // try anchor
-  anchor = null;
-  if (hitResult && hitResult.createAnchor) {
-    try {
-      anchor = await hitResult.createAnchor();
-    } catch(e){
-      console.warn('Anchor create failed', e);
-    }
-  }
-
-  if (!anchor) {
-    // fallback to matrix placement
-    avatar.position.setFromMatrixPosition(m);
-    const cam = renderer.xr.getCamera(camera);
-    avatar.lookAt(new THREE.Vector3(cam.position.x, avatar.position.y, cam.position.z));
-  } else {
-    // set initial matrix from anchor immediately
-    const ap = frame?.getPose(anchor.anchorSpace, localSpace);
-    if (ap){
-      avatar.matrix.fromArray(ap.transform.matrix);
-      avatar.matrix.decompose(avatar.position, avatar.quaternion, avatar.scale);
-    }
-  }
-
-  placed = true;
-  reticle.visible = false;
-
-  mixer.stopAllAction();
-  currentAction = null;
+// place on plane and start animation cycle
+function place(m){
+  avatar.visible=true;
+  avatar.position.setFromMatrixPosition(m);
+  const cam=renderer.xr.getCamera(camera);
+  avatar.lookAt(new THREE.Vector3(cam.position.x,avatar.position.y,cam.position.z));
+  placed=true;
+  reticle.visible=false;
   playNext();
 }
-
-// Reset button
-document.getElementById('reset').addEventListener('click', ()=>{
-  placed = false;
-  avatar.visible = false;
-  if (anchor?.delete) { try { anchor.delete(); } catch {} }
-  anchor = null;
-});
-
 </script>
 </body>
 </html>
