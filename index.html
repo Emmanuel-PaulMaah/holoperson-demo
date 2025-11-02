@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>WebXR AR • RPM + Mixamo autoplay + light estimation</title>
+  <title>WebXR AR • RPM + Mixamo autoplay • artificial lighting</title>
   <link rel="icon" href="data:,">
   <script type="importmap">
   {
@@ -15,12 +15,11 @@
   </script>
   <style>
     html, body { margin:0; height:100%; background:#000; }
-    #enter-ar { position:fixed; left:12px; bottom:12px; z-index:10; }
     .hint { position:fixed; left:12px; top:12px; color:#fff; font:14px/1.4 system-ui, sans-serif; }
   </style>
 </head>
 <body>
-<div class="hint">Auto-place on first plane. Animations cycle. Uses real-world light when available.</div>
+<div class="hint">Auto-place on first plane. Animations cycle. Fixed studio lighting (no room light).</div>
 
 <script type="module">
 import * as THREE from 'three';
@@ -40,8 +39,11 @@ const ANIM_URLS = [
 // renderer
 const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
 renderer.xr.enabled = true;
-renderer.setSize(innerWidth, innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+renderer.physicallyCorrectLights = true;
+renderer.setSize(innerWidth, innerHeight);
 document.body.appendChild(renderer.domElement);
 addEventListener('resize', ()=>renderer.setSize(innerWidth, innerHeight), { passive:true });
 
@@ -49,19 +51,35 @@ addEventListener('resize', ()=>renderer.setSize(innerWidth, innerHeight), { pass
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera();
 
-// fallback lights
-const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.6);
-const dir  = new THREE.DirectionalLight(0xffffff, 0.4);
-dir.position.set(1,2,1);
-scene.add(hemi, dir);
-
-// IBL fallback (keeps AR passthrough since we do not set background)
+// --- Artificial lighting rig (three-point + IBL). No light estimation. ---
+// Image-based lighting for PBR materials
+const pmrem = new THREE.PMREMGenerator(renderer);
 new RGBELoader()
   .setPath('https://cdn.jsdelivr.net/gh/pmndrs/drei-assets@master/hdri/')
   .load('venice_sunset_1k.hdr', (hdr)=>{
-    hdr.mapping = THREE.EquirectangularReflectionMapping;
-    scene.environment = hdr;
+    const envMap = pmrem.fromEquirectangular(hdr).texture;
+    scene.environment = envMap; // keeps AR passthrough since no background set
+    hdr.dispose();
   });
+
+// Key light (warm)
+const key = new THREE.DirectionalLight(0xfff1df, 2.2);
+key.position.set(1.5, 2.5, 0.8);
+scene.add(key);
+
+// Fill light (cooler, softer)
+const fill = new THREE.DirectionalLight(0xdfe8ff, 0.8);
+fill.position.set(-1.2, 1.8, 1.2);
+scene.add(fill);
+
+// Rim light (neutral, highlights silhouette)
+const rim = new THREE.DirectionalLight(0xffffff, 1.4);
+rim.position.set(-0.5, 2.8, -1.8);
+scene.add(rim);
+
+// Low ambient floor via hemisphere to keep undersides readable
+const hemi = new THREE.HemisphereLight(0xffffff, 0x3a3a3a, 0.25);
+scene.add(hemi);
 
 // reticle
 const reticle = new THREE.Mesh(
@@ -72,10 +90,10 @@ reticle.matrixAutoUpdate = false;
 reticle.visible = false;
 scene.add(reticle);
 
-// AR button
+// AR button (no light-estimation requested)
 document.body.appendChild(ARButton.createButton(renderer,{
   requiredFeatures:['hit-test'],
-  optionalFeatures:['dom-overlay','anchors','light-estimation'],
+  optionalFeatures:['dom-overlay','anchors'],
   domOverlay:{ root: document.body }
 }));
 
@@ -94,6 +112,19 @@ await gltf.loadAsync(AVATAR_URL).then(g=>{
   avatar=g.scene;
   scene.add(avatar);
   avatar.visible=false;
+
+  // ensure materials respond to IBL and lights
+  avatar.traverse((o)=>{
+    if(o.isMesh){
+      o.castShadow = false;
+      o.receiveShadow = false;
+      if(o.material){
+        // keep as is; GLTF PBR will use scene.environment
+        o.material.needsUpdate = true;
+      }
+    }
+  });
+
   mixer=new THREE.AnimationMixer(avatar);
   mixer.addEventListener('finished', ()=> playNext()); // auto-cycle
   outline=new THREE.BoxHelper(avatar,0xff7a00);
@@ -128,7 +159,6 @@ function playNext(){
 
 // XR vars
 let viewerSpace, localSpace, planeSource, fingerSource;
-let xrLightProbe=null, xrDirLight=null;
 let lastDist, lastAngle, baseScale=1, baseRotY=0;
 
 renderer.xr.addEventListener('sessionstart',async()=>{
@@ -137,29 +167,11 @@ renderer.xr.addEventListener('sessionstart',async()=>{
   localSpace=await s.requestReferenceSpace('local');
   planeSource=await s.requestHitTestSource({space:viewerSpace});
   fingerSource=await s.requestHitTestSourceForTransientInput({profile:'generic-touchscreen'});
-
-  // light estimation
-  try{
-    const probe = await s.requestLightProbe?.({ reflectionFormat: 'srgba8' });
-    if(probe){
-      xrLightProbe = probe;
-      xrDirLight = new THREE.DirectionalLight(0xffffff, 0.0);
-      scene.add(xrDirLight);
-      hemi.intensity = 0.2;
-      dir.intensity  = 0.1;
-    }
-  }catch(e){
-    // unsupported or permissions denied
-  }
 });
 
 renderer.xr.addEventListener('sessionend',()=>{
   viewerSpace=localSpace=planeSource=fingerSource=null;
   placed=false;
-  if(xrDirLight){ scene.remove(xrDirLight); xrDirLight=null; }
-  xrLightProbe=null;
-  hemi.intensity = 0.6;
-  dir.intensity  = 0.4;
 });
 
 // loop
@@ -167,27 +179,6 @@ const clock=new THREE.Clock();
 renderer.setAnimationLoop((_,frame)=>{
   const dt=clock.getDelta();
   mixer?.update(dt);
-
-  // update real-world lighting
-  if(frame && xrLightProbe && xrDirLight){
-    const est = frame.getLightEstimate?.(xrLightProbe);
-    if(est){
-      const d = est.primaryLightDirection;   // Float32Array[3]
-      const i = est.primaryLightIntensity;   // Float32Array[3]
-      // position opposite to direction vector so light points along the estimate
-      xrDirLight.position.set(-d[0], -d[1], -d[2]).normalize();
-
-      // compute luminance and color
-      const r=i[0], g=i[1], b=i[2];
-      const luminance = 0.2126*r + 0.7152*g + 0.0722*b;
-      const scale = 0.002; // tame to Three intensity range
-      const targetIntensity = luminance * scale;
-      xrDirLight.intensity = THREE.MathUtils.lerp(xrDirLight.intensity, targetIntensity, 0.2);
-
-      const maxc = Math.max(r,g,b) || 1.0;
-      xrDirLight.color.setRGB(r/maxc, g/maxc, b/maxc).convertSRGBToLinear();
-    }
-  }
 
   // plane reticle
   if(frame && planeSource && !placed){
